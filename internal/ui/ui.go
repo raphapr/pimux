@@ -1,19 +1,20 @@
 // Package ui implements the pimux Bubble Tea dashboard: a live, grouped list of
-// pi agents across tmux sessions with a pane preview and jump/seen/interrupt
-// actions.
+// pi agents across tmux sessions with a session-content preview and jump/seen /
+// interrupt actions.
 package ui
 
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/raphapr/pimux/internal/agent"
+	"github.com/raphapr/pimux/internal/session"
 	"github.com/raphapr/pimux/internal/tmux"
 )
 
@@ -23,29 +24,28 @@ type agentsMsg struct {
 	err    error
 }
 type previewMsg struct {
-	pane string
-	body string
+	pane  string
+	lines []session.Line
 }
 
 // Model is the dashboard state.
 type Model struct {
-	agents       []agent.Agent
-	cursor       int
-	width        int
-	height       int
-	preview      string
-	previewPane  string
-	filter       string
-	filtering    bool
-	confirmKill  bool
-	err          error
-	pollEvery    time.Duration
-	captureLines int
+	agents      []agent.Agent
+	cursor      int
+	width       int
+	height      int
+	query       string
+	sortMode    agent.SortMode
+	preview     []session.Line
+	previewPane string
+	confirmKill bool
+	err         error
+	pollEvery   time.Duration
 }
 
 // New returns a dashboard model with default polling.
 func New() Model {
-	return Model{pollEvery: time.Second, captureLines: 80}
+	return Model{pollEvery: time.Second, sortMode: agent.Grouped}
 }
 
 // Init starts the first load and the poll ticker.
@@ -66,36 +66,23 @@ func loadCmd() tea.Cmd {
 	}
 }
 
-func previewCmd(pane string, lines int) tea.Cmd {
-	if pane == "" {
+func previewCmd(a agent.Agent) tea.Cmd {
+	if a.PaneID == "" || a.SessionPath == "" {
 		return nil
 	}
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		return previewMsg{pane: pane, body: tmux.Capture(ctx, pane, lines)}
+		return previewMsg{pane: a.PaneID, lines: session.TranscriptTail(a.SessionPath, 14)}
 	}
 }
 
-// visible returns the sorted, filtered agent list.
-func (m Model) visible() []agent.Agent {
-	out := make([]agent.Agent, 0, len(m.agents))
-	f := strings.ToLower(strings.TrimSpace(m.filter))
-	for _, a := range m.agents {
-		if f != "" {
-			hay := strings.ToLower(a.Session + " " + a.Project + " " + a.Msg + " " + string(a.State))
-			if !strings.Contains(hay, f) {
-				continue
-			}
-		}
-		out = append(out, a)
-	}
-	sort.SliceStable(out, func(i, j int) bool { return agent.Less(out[i], out[j]) })
-	return out
+func (m Model) visibleAgents() []agent.Agent {
+	ordered := agent.Order(m.agents, m.sortMode)
+	filtered, _ := agent.Filter(ordered, m.query)
+	return filtered
 }
 
 func (m Model) selected() (agent.Agent, bool) {
-	v := m.visible()
+	v := m.visibleAgents()
 	if m.cursor < 0 || m.cursor >= len(v) {
 		return agent.Agent{}, false
 	}
@@ -111,20 +98,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		sel, _ := m.selected()
-		return m, tea.Batch(loadCmd(), tickCmd(m.pollEvery), previewCmd(sel.PaneID, m.captureLines))
+		return m, tea.Batch(loadCmd(), tickCmd(m.pollEvery), previewCmd(sel))
 
 	case agentsMsg:
 		m.err = msg.err
 		m.agents = msg.agents
-		if n := len(m.visible()); m.cursor >= n {
-			m.cursor = max(0, n-1)
-		}
-		return m, nil
+		m.clampCursor()
+		sel, _ := m.selected()
+		return m, previewCmd(sel)
 
 	case previewMsg:
 		sel, ok := m.selected()
 		if ok && msg.pane == sel.PaneID {
-			m.preview = msg.body
+			m.preview = msg.lines
 			m.previewPane = msg.pane
 		}
 		return m, nil
@@ -136,72 +122,149 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Confirm-kill sub-state takes precedence.
 	if m.confirmKill {
-		if msg.String() == "y" {
+		switch msg.String() {
+		case "y":
 			m.confirmKill = false
 			if sel, ok := m.selected(); ok {
 				return m, runOnceCmd(tmux.InterruptArgs(sel.PaneID))
 			}
-		}
-		m.confirmKill = false
-		return m, nil
-	}
-
-	if m.filtering {
-		switch msg.Type {
-		case tea.KeyEsc:
-			m.filtering = false
-			m.filter = ""
-		case tea.KeyEnter:
-			m.filtering = false
-		case tea.KeyBackspace:
-			if m.filter != "" {
-				m.filter = m.filter[:len(m.filter)-1]
-			}
-		case tea.KeyRunes, tea.KeySpace:
-			m.filter += string(msg.Runes)
-		}
-		if m.cursor >= len(m.visible()) {
-			m.cursor = max(0, len(m.visible())-1)
+		case "n", "esc":
+			m.confirmKill = false
 		}
 		return m, nil
 	}
 
 	switch msg.String() {
-	case "q", "ctrl+c", "esc":
+	case "ctrl+c":
 		return m, tea.Quit
-	case "j", "down":
-		if m.cursor < len(m.visible())-1 {
-			m.cursor++
+	case "esc":
+		if m.query != "" {
+			m.query = ""
+			m.clampCursor()
+			return m, nil
 		}
-		sel, _ := m.selected()
-		return m, previewCmd(sel.PaneID, m.captureLines)
-	case "k", "up":
-		if m.cursor > 0 {
-			m.cursor--
-		}
-		sel, _ := m.selected()
-		return m, previewCmd(sel.PaneID, m.captureLines)
-	case "/":
-		m.filtering = true
+		return m, tea.Quit
+	case "ctrl+j", "ctrl+n", "down":
+		m.move(1)
+		return m, m.selectedPreviewCmd()
+	case "ctrl+k", "ctrl+p", "up":
+		m.move(-1)
+		return m, m.selectedPreviewCmd()
+	case "ctrl+u":
+		m.query = ""
+		m.clampCursor()
 		return m, nil
-	case "r":
-		return m, loadCmd()
-	case "d":
+	case "ctrl+w":
+		m.deleteWord()
+		m.clampCursor()
+		return m, nil
+	case "ctrl+d":
 		if sel, ok := m.selected(); ok {
 			return m, runCmd(tmux.MarkSeenArgs(sel.PaneID))
 		}
-	case "x":
+	case "ctrl+x":
 		if _, ok := m.selected(); ok {
 			m.confirmKill = true
 		}
+	case "ctrl+r":
+		return m, loadCmd()
+	case "tab":
+		m.cycleSort()
+		m.clampCursor()
+		return m, m.selectedPreviewCmd()
 	case "enter":
 		if sel, ok := m.selected(); ok {
 			return m, tea.Sequence(runCmd(tmux.JumpArgs(sel)), tea.Quit)
 		}
+	case "backspace":
+		m.query = dropLastRune(m.query)
+		m.clampCursor()
+		return m, nil
+	case " ":
+		m.query += " "
+		m.clampCursor()
+		return m, nil
+	}
+
+	if msg.Type == tea.KeyRunes {
+		m.query += string(msg.Runes)
+		m.clampCursor()
 	}
 	return m, nil
+}
+
+func (m *Model) clampCursor() {
+	n := len(m.visibleAgents())
+	if n == 0 {
+		m.cursor = 0
+		return
+	}
+	if m.cursor >= n {
+		m.cursor = n - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+}
+
+func (m *Model) move(delta int) {
+	n := len(m.visibleAgents())
+	if n == 0 {
+		m.cursor = 0
+		return
+	}
+	m.cursor += delta
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor >= n {
+		m.cursor = n - 1
+	}
+}
+
+func (m *Model) cycleSort() {
+	switch m.sortMode {
+	case agent.Grouped:
+		m.sortMode = agent.PriorityMode
+	case agent.PriorityMode:
+		m.sortMode = agent.Recent
+	default:
+		m.sortMode = agent.Grouped
+	}
+}
+
+func (m Model) selectedPreviewCmd() tea.Cmd {
+	sel, ok := m.selected()
+	if !ok {
+		return nil
+	}
+	return previewCmd(sel)
+}
+
+func (m *Model) deleteWord() {
+	m.query = strings.TrimRight(m.query, " ")
+	for m.query != "" {
+		r, size := utf8.DecodeLastRuneInString(m.query)
+		if r == utf8.RuneError && size == 0 {
+			break
+		}
+		if r == ' ' {
+			break
+		}
+		m.query = m.query[:len(m.query)-size]
+	}
+}
+
+func dropLastRune(s string) string {
+	if s == "" {
+		return s
+	}
+	_, size := utf8.DecodeLastRuneInString(s)
+	if size <= 0 {
+		return ""
+	}
+	return s[:len(s)-size]
 }
 
 func runCmd(cmds [][]string) tea.Cmd {
@@ -225,15 +288,28 @@ func runOnceCmd(args []string) tea.Cmd {
 // --- rendering -----------------------------------------------------------
 
 var (
-	stWorking = lipgloss.NewStyle().Foreground(lipgloss.Color("3")) // yellow
-	stBlocked = lipgloss.NewStyle().Foreground(lipgloss.Color("1")) // red
-	stDone    = lipgloss.NewStyle().Foreground(lipgloss.Color("4")) // blue
-	stIdle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8")) // gray
-	stStale   = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Strikethrough(true)
-	stHeader  = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
-	stCursor  = lipgloss.NewStyle().Background(lipgloss.Color("8")).Foreground(lipgloss.Color("15"))
-	stDim     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	stTitle   = lipgloss.NewStyle().Bold(true)
+	mochaBase     = lipgloss.Color("#1e1e2e")
+	mochaSurface0 = lipgloss.Color("#313244")
+	mochaOverlay0 = lipgloss.Color("#6c7086")
+	mochaOverlay1 = lipgloss.Color("#7f849c")
+	mochaText     = lipgloss.Color("#cdd6f4")
+	mochaRed      = lipgloss.Color("#f38ba8")
+	mochaYellow   = lipgloss.Color("#f9e2af")
+	mochaTeal     = lipgloss.Color("#94e2d5")
+	mochaGreen    = lipgloss.Color("#a6e3a1")
+	mochaMauve    = lipgloss.Color("#cba6f7")
+
+	stWorking = lipgloss.NewStyle().Foreground(mochaYellow)
+	stBlocked = lipgloss.NewStyle().Foreground(mochaRed)
+	stDone    = lipgloss.NewStyle().Foreground(mochaTeal)
+	stIdle    = lipgloss.NewStyle().Foreground(mochaGreen)
+	stStale   = lipgloss.NewStyle().Foreground(mochaOverlay0).Strikethrough(true)
+	stHeader  = lipgloss.NewStyle().Foreground(mochaOverlay0).Bold(true)
+	stCursor  = lipgloss.NewStyle().Background(mochaSurface0).Foreground(mochaText)
+	stDim     = lipgloss.NewStyle().Foreground(mochaOverlay0)
+	stMuted   = lipgloss.NewStyle().Foreground(mochaOverlay1)
+	stTitle   = lipgloss.NewStyle().Foreground(mochaText).Bold(true)
+	stAccent  = lipgloss.NewStyle().Foreground(mochaMauve).Bold(true)
 )
 
 func dot(a agent.Agent) (string, lipgloss.Style) {
@@ -242,11 +318,11 @@ func dot(a agent.Agent) (string, lipgloss.Style) {
 	}
 	switch a.State {
 	case agent.Blocked:
-		return "⚠", stBlocked
+		return "●", stBlocked
 	case agent.Working:
-		return "⚙", stWorking
+		return "●", stWorking
 	case agent.Done:
-		return "✓", stDone
+		return "●", stDone
 	default:
 		return "○", stIdle
 	}
@@ -254,91 +330,176 @@ func dot(a agent.Agent) (string, lipgloss.Style) {
 
 func stateLabel(a agent.Agent, now int64) string {
 	if a.Stale {
-		return "stale (process gone)"
+		return "stale"
 	}
 	age := agent.Humanize(now, a.TS)
 	base := string(a.State)
 	if a.State == agent.Blocked && a.Msg != "" {
-		base = "waiting: " + a.Msg
+		base = "blocked · " + a.Msg
 	} else if a.Msg != "" {
 		base = string(a.State) + " · " + a.Msg
 	}
 	if age != "" {
-		return base + " " + age
+		return base + " · " + age
 	}
 	return base
 }
 
 // View renders the dashboard.
 func (m Model) View() string {
-	v := m.visible()
-	now := time.Now().UnixMilli()
+	v := m.visibleAgents()
+	if len(v) == 0 {
+		return m.emptyView()
+	}
 
+	leftW, rightW := m.layoutWidths()
+	sidebar := m.renderSidebar(leftW)
+	preview := m.renderPreview(rightW)
+	if m.width > 0 && m.width < 70 {
+		return sidebar + "\n" + stDim.Render(strings.Repeat("─", maxInt(10, m.width))) + "\n" + preview
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, preview)
+}
+
+func (m Model) emptyView() string {
+	if strings.TrimSpace(m.query) != "" {
+		return stTitle.Render("pimux") + "  " + stDim.Render("No pi agents match “"+m.query+"”.")
+	}
+	return stTitle.Render("pimux") + "  " + stDim.Render("No pi agents reporting. Start pi in a tmux pane.")
+}
+
+func (m Model) layoutWidths() (int, int) {
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+	left := w * 32 / 100
+	if left < 26 {
+		left = 26
+	}
+	if left > 34 {
+		left = 34
+	}
+	right := w - left
+	if right < 24 {
+		right = 24
+	}
+	return left, right
+}
+
+func (m Model) renderSidebar(width int) string {
 	var b strings.Builder
-	title := stTitle.Render("pimux")
-	b.WriteString(fmt.Sprintf("%s  %s\n", title, stDim.Render(fmt.Sprintf("%d agent(s)", len(v)))))
+	b.WriteString(stTitle.Render("pimux") + "  " + stDim.Render(fmt.Sprintf("%d agent(s)", len(m.visibleAgents()))) + "  " + stMuted.Render(string(m.sortMode)) + "\n")
 	if m.err != nil {
 		b.WriteString(stBlocked.Render("error: "+m.err.Error()) + "\n")
 	}
-	b.WriteString("\n")
+	b.WriteString(stAccent.Render("search>") + " " + m.query + "▏\n")
 
-	if len(v) == 0 {
-		b.WriteString(stDim.Render("No pi agents reporting. Start pi in a tmux pane.\n"))
-	}
-
-	lastSession := ""
-	for i, a := range v {
-		if a.Session != lastSession {
-			b.WriteString(stHeader.Render(a.Session) + "\n")
-			lastSession = a.Session
-		}
-		glyph, gs := dot(a)
-		line := fmt.Sprintf("  %s %-14s %s", gs.Render(glyph), trunc(a.Project, 14), stateLabel(a, now))
-		if i == m.cursor {
-			line = stCursor.Render(trunc(strings.TrimRight(line, " "), maxInt(20, m.width-1)))
+	rows := m.displayRows(width)
+	for _, row := range rows {
+		line := row.text
+		if row.selected {
+			line = stCursor.Render(truncDisplay(strings.TrimRight(line, " "), width))
 		}
 		b.WriteString(line + "\n")
 	}
+	return lipgloss.NewStyle().Width(width).Render(strings.TrimRight(b.String(), "\n"))
+}
 
-	// Preview of the selected pane.
-	if sel, ok := m.selected(); ok && m.preview != "" {
-		b.WriteString("\n" + stDim.Render(strings.Repeat("─", maxInt(10, m.width-1))) + "\n")
-		b.WriteString(stDim.Render("preview "+sel.Session+" "+sel.PaneID) + "\n")
-		b.WriteString(previewTail(m.preview, m.previewHeight()) + "\n")
+type displayRow struct {
+	text     string
+	selected bool
+}
+
+func (m Model) displayRows(width int) []displayRow {
+	v := m.visibleAgents()
+	selected, _ := m.selected()
+	if m.sortMode != agent.Grouped {
+		rows := make([]displayRow, 0, len(v))
+		for _, a := range v {
+			rows = append(rows, displayRow{text: m.agentLine(a, a.Session, width, false), selected: a.PaneID == selected.PaneID})
+		}
+		return rows
 	}
 
-	// Footer.
-	b.WriteString("\n")
-	if m.confirmKill {
-		b.WriteString(stBlocked.Render("interrupt this agent (send C-c)? y/N"))
-	} else if m.filtering {
-		b.WriteString(stTitle.Render("filter: ") + m.filter + stDim.Render("  (enter=keep esc=clear)"))
+	var rows []displayRow
+	for i := 0; i < len(v); {
+		sessionName := v[i].Session
+		j := i
+		for j < len(v) && v[j].Session == sessionName {
+			j++
+		}
+		group := v[i:j]
+		if len(group) == 1 {
+			a := group[0]
+			rows = append(rows, displayRow{text: m.agentLine(a, a.Session, width, false), selected: a.PaneID == selected.PaneID})
+		} else {
+			roll := group[0]
+			glyph, gs := dot(roll)
+			rows = append(rows, displayRow{text: fmt.Sprintf(" %s %-18s %s", gs.Render(glyph), trunc(sessionName, 18), stDim.Render(fmt.Sprintf("%d agents", len(group))))})
+			for _, a := range group {
+				label := windowLabel(a)
+				rows = append(rows, displayRow{text: m.agentLine(a, label, width, true), selected: a.PaneID == selected.PaneID})
+			}
+		}
+		i = j
+	}
+	return rows
+}
+
+func windowLabel(a agent.Agent) string {
+	if a.WindowName == "" || a.WindowName == "Window" {
+		return fmt.Sprintf("%d", a.Window)
+	}
+	return a.WindowName
+}
+
+func (m Model) agentLine(a agent.Agent, label string, width int, child bool) string {
+	glyph, gs := dot(a)
+	prefix := " "
+	if child {
+		prefix = "   "
+	}
+	state := string(a.State)
+	if a.Stale {
+		state = "stale"
+	}
+	line := fmt.Sprintf("%s%s %-16s %s", prefix, gs.Render(glyph), trunc(label, 16), stDim.Render(state))
+	return truncDisplay(line, width)
+}
+
+func (m Model) renderPreview(width int) string {
+	sel, ok := m.selected()
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(stAccent.Render(sel.Project) + " · " + stTitle.Render(sel.Model) + "\n")
+	b.WriteString(stDim.Render(sel.PaneID+" · "+sel.Path) + "\n")
+	b.WriteString(m.stateLine(sel) + "\n")
+	b.WriteString(stDim.Render(strings.Repeat("─", maxInt(10, width))) + "\n")
+	b.WriteString(stHeader.Render("session content") + "\n")
+	if sel.PaneID == m.previewPane && len(m.preview) > 0 {
+		for _, line := range m.preview {
+			b.WriteString(renderTranscriptLine(line, width) + "\n")
+		}
 	} else {
-		b.WriteString(stDim.Render("enter=jump  j/k=move  /=filter  d=seen  x=interrupt  r=refresh  q=quit"))
+		b.WriteString(stDim.Render("No session content loaded yet.") + "\n")
 	}
-	return b.String()
+	return lipgloss.NewStyle().Width(width).Render(strings.TrimRight(b.String(), "\n"))
 }
 
-func (m Model) previewHeight() int {
-	if m.height <= 0 {
-		return 8
-	}
-	h := m.height - len(m.visible()) - 8
-	if h < 4 {
-		h = 4
-	}
-	if h > 20 {
-		h = 20
-	}
-	return h
+func (m Model) stateLine(a agent.Agent) string {
+	glyph, gs := dot(a)
+	return gs.Render(glyph) + " " + stateLabel(a, time.Now().UnixMilli())
 }
 
-func previewTail(s string, n int) string {
-	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
+func renderTranscriptLine(line session.Line, width int) string {
+	role := line.Role
+	if role == "toolResult" || role == "bashExecution" {
+		role = "tool"
 	}
-	return stDim.Render(strings.Join(lines, "\n"))
+	return truncDisplay(stDim.Render("▸ ")+stMuted.Render(fmt.Sprintf("%-9s", role))+" "+line.Text, width)
 }
 
 func trunc(s string, n int) string {
@@ -351,14 +512,21 @@ func trunc(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-func maxInt(a, b int) int {
-	if a > b {
-		return a
+func truncDisplay(s string, n int) string {
+	if n <= 0 {
+		return ""
 	}
-	return b
+	if lipgloss.Width(s) <= n {
+		return s
+	}
+	plain := []rune(s)
+	if len(plain) <= n {
+		return s
+	}
+	return string(plain[:maxInt(1, n-1)]) + "…"
 }
 
-func max(a, b int) int {
+func maxInt(a, b int) int {
 	if a > b {
 		return a
 	}

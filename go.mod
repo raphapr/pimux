@@ -1,12 +1,13 @@
 module github.com/raphapr/pimux
 
-go 1.24.0
+go 1.24.5
 
 toolchain go1.24.13
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/sahilm/fuzzy v0.1.3
 )
 
 require (

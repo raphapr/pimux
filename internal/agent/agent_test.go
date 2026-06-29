@@ -3,8 +3,8 @@ package agent
 import "testing"
 
 func line(state, sess, cmd string) string {
-	// pane|session|window|pid|cmd|path|state|project|model|msg|ts|sessionpath
-	return "%1|" + sess + "|1|123|" + cmd + "|/p|" + state + "|proj|sonnet|msg|1000|/s.jsonl"
+	// pane|session|window|window_name|pid|cmd|path|state|project|model|msg|ts|sessionpath
+	return "%1|" + sess + "|1|main|123|" + cmd + "|/p|" + state + "|proj|sonnet|msg|1000|/s.jsonl"
 }
 
 func TestParseLineSkipsNonAgents(t *testing.T) {
@@ -20,11 +20,11 @@ func TestParseLineSkipsNonAgents(t *testing.T) {
 }
 
 func TestParseLineFields(t *testing.T) {
-	a, ok := ParseLine(line("working", "ls-n8n", "pi"))
+	a, ok := ParseLine(line("working", "alpha", "pi"))
 	if !ok {
 		t.Fatal("valid agent line should parse")
 	}
-	if a.PaneID != "%1" || a.Session != "ls-n8n" || a.Window != 1 || a.PID != 123 {
+	if a.PaneID != "%1" || a.Session != "alpha" || a.Window != 1 || a.WindowName != "main" || a.PID != 123 {
 		t.Fatalf("bad fields: %+v", a)
 	}
 	if a.State != Working || a.Project != "proj" || a.Model != "sonnet" || a.TS != 1000 {
@@ -62,9 +62,9 @@ func TestPriorityAndLess(t *testing.T) {
 	idle, _ := ParseLine(line("idle", "a", "pi"))
 	stale, _ := ParseLine(line("working", "a", "fish"))
 
-	if !(Priority(blocked) < Priority(working) &&
-		Priority(working) < Priority(done) &&
-		Priority(done) < Priority(idle) &&
+	if !(Priority(blocked) < Priority(done) &&
+		Priority(done) < Priority(working) &&
+		Priority(working) < Priority(idle) &&
 		Priority(idle) < Priority(stale)) {
 		t.Fatal("priority order wrong")
 	}

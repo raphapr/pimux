@@ -20,17 +20,18 @@ const (
 
 // ListFormat is the -F format passed to `tmux list-panes -a`. Field order must
 // match ParseLine below.
-const ListFormat = "#{pane_id}|#{session_name}|#{window_index}|#{pane_pid}|" +
+const ListFormat = "#{pane_id}|#{session_name}|#{window_index}|#{window_name}|#{pane_pid}|" +
 	"#{pane_current_command}|#{pane_current_path}|#{@pimux_state}|#{@pimux_project}|" +
 	"#{@pimux_model}|#{@pimux_msg}|#{@pimux_ts}|#{@pimux_session}"
 
-const fieldCount = 12
+const fieldCount = 13
 
 // Agent is one pi pane and its reported state.
 type Agent struct {
 	PaneID      string `json:"pane_id"`
 	Session     string `json:"session"` // tmux session name (the "project")
 	Window      int    `json:"window"`
+	WindowName  string `json:"window_name"`
 	PID         int    `json:"pid"`
 	Cmd         string `json:"cmd"`
 	Path        string `json:"path"`
@@ -55,7 +56,7 @@ func ParseLine(line string) (Agent, bool) {
 	if len(f) != fieldCount {
 		return Agent{}, false
 	}
-	state := strings.TrimSpace(f[6])
+	state := strings.TrimSpace(f[7])
 	if state == "" {
 		return Agent{}, false // not a pi agent
 	}
@@ -63,15 +64,16 @@ func ParseLine(line string) (Agent, bool) {
 		PaneID:      f[0],
 		Session:     f[1],
 		Window:      atoi(f[2]),
-		PID:         atoi(f[3]),
-		Cmd:         f[4],
-		Path:        f[5],
+		WindowName:  f[3],
+		PID:         atoi(f[4]),
+		Cmd:         f[5],
+		Path:        f[6],
 		State:       State(state),
-		Project:     f[7],
-		Model:       f[8],
-		Msg:         f[9],
-		TS:          atoi64(f[10]),
-		SessionPath: f[11],
+		Project:     f[8],
+		Model:       f[9],
+		Msg:         f[10],
+		TS:          atoi64(f[11]),
+		SessionPath: f[12],
 	}
 	// Foreground command no longer pi => the reported state is stale.
 	if a.Cmd != "pi" {
@@ -91,8 +93,9 @@ func Parse(out string) []Agent {
 	return agents
 }
 
-// Priority orders states for display: blocked first (needs you), then working,
-// then done (finished/unseen), then idle. Stale sinks to the bottom.
+// Priority orders states for display using herdr's attention order: blocked
+// first (needs you), then done (finished/unseen), working, then idle. Stale
+// sinks to the bottom.
 func Priority(a Agent) int {
 	if a.Stale {
 		return 5
@@ -100,9 +103,9 @@ func Priority(a Agent) int {
 	switch a.State {
 	case Blocked:
 		return 0
-	case Working:
-		return 1
 	case Done:
+		return 1
+	case Working:
 		return 2
 	case Idle:
 		return 3
