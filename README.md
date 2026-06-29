@@ -4,7 +4,7 @@ See every [pi](https://github.com/earendil-works/pi-mono) agent across your tmux
 
 ```
 tmux session  = project
-  └─ pane running `pi` = an agent  →  working ⚙ | needs-you ⚠ | done ✓ | idle ○
+  └─ pane running `pi` = an agent  →  working ● | needs-you ● | done ● | idle ○
 ```
 
 Unlike tools that scrape terminal output to guess agent state, pimux uses pi's own lifecycle events: a small pi extension reports state into tmux pane options, so the signal is authoritative.
@@ -12,27 +12,30 @@ Unlike tools that scrape terminal output to guess agent state, pimux uses pi's o
 ## Parts
 
 1. **Reporter** (`extension/pimux-reporter.ts`) — a pi extension. On every pi session inside tmux it writes `@pimux_state` (and `@pimux_project`, `@pimux_model`, `@pimux_msg`, `@pimux_ts`, `@pimux_session`, `@pimux_pid`, and a window rollup `@pimux_win_state`) keyed by `$TMUX_PANE`. It is a no-op outside tmux and never blocks the agent turn.
-2. **Status dots** (`pimux.conf`) — appends a colored dot to the tmux `window-status-format` based on `@pimux_state`, plus a `pane-focus-in` hook that clears the blue ✓ once you look at a finished agent.
-3. **`pimux`** — a Go/Bubble Tea popup that lists agents grouped by session, previews the selected pane, and jumps to it.
+2. **Status dots** (`pimux.conf`) — appends a colored dot to the tmux `window-status-format` based on `@pimux_state`, plus a `pane-focus-in` hook that clears the done marker once you look at a finished agent.
+3. **`pimux`** — a Go/Bubble Tea popup that fuzzy-filters agents, ranks by recency, previews session content, and jumps to a pane.
 
 ## State model
 
-| State   | When                                                | Dot      |
-| ------- | --------------------------------------------------- | -------- |
-| working | between `agent_start` and `agent_end`               | ⚙ yellow |
-| blocked | a prompt-style tool is waiting on you (or `pimux:blocked`)  | ⚠ red    |
-| done    | finished, not yet looked at                         | ✓ blue   |
-| idle    | at rest / seen                                      | ○ dim    |
-| stale   | option set but foreground process is no longer `pi` | ✗ struck |
+| State   | When                                                       | Popup dot |
+| ------- | ---------------------------------------------------------- | --------- |
+| blocked | a prompt-style tool is waiting on you (or `pimux:blocked`) | ● red     |
+| working | between `agent_start` and `agent_end`                      | ● yellow  |
+| done    | finished, not yet looked at                                | ● teal    |
+| idle    | at rest / seen                                             | ○ green   |
+| stale   | option set but foreground process is no longer `pi`        | ✗ struck  |
+
+The popup mirrors herdr's dot language. `done` means finished but unseen; tmux's `pane-focus-in` hook turns `done` into `idle` after you look.
 
 ## Install
 
 ```sh
 # 1. Binary
 make install                 # go build -> ~/.local/bin/pimux
+# or: go install github.com/raphapr/pimux@latest
 
 # 2. Reporter extension (global, all pi sessions)
-make install-extension       # copies extension/pimux-reporter.ts -> ~/.pi/agent/extensions/
+pimux install-extension      # writes the embedded reporter -> ~/.pi/agent/extensions/
 
 # 3. tmux integration
 cp pimux.conf ~/.tmux/pimux.conf
@@ -40,21 +43,52 @@ printf '\nsource-file ~/.tmux/pimux.conf\n' >> ~/.tmux.conf   # or your tmux.con
 tmux source-file ~/.tmux/pimux.conf
 ```
 
-`pimux.conf` binds the dashboard to `prefix + g`:
+`pimux install-extension` writes `pimux-reporter.ts` into the pi extensions dir. The reporter is embedded in the binary, so `go install` users do not need the source tree. Override the target with `--dir` or `$PIMUX_EXT_DIR`. Restart pi sessions afterward to load it.
+
+`pimux.conf` binds the dashboard to `prefix + a`:
 
 ```tmux
-bind g display-popup -E -w 90% -h 80% pimux
+bind a display-popup -E -w 60% -h 60% pimux
 ```
 
 Requires tmux ≥ 3.2 and Go ≥ 1.24 to build.
 
 ## Usage
 
-- `prefix + g` — open the dashboard popup.
-- In the dashboard: `enter` jump · `j`/`k` move · `/` filter · `d` mark seen ·
-  `x` interrupt (confirm) · `r` refresh · `q` quit.
+- `prefix + a` — open the dashboard popup.
+- `pimux install-extension` — install the reporter pi extension (`--dir` to override the target).
 - `pimux --json` — print discovered agents as JSON (scripting / debugging).
 - `pimux --version`.
+
+The popup is non-modal. The search input is always active, so printable keys edit the query. Vim-style control chords handle movement and actions.
+
+| Key                   | Action                                                             |
+| --------------------- | ------------------------------------------------------------------ |
+| type                  | fuzzy-filter agents (filter-only; match score never reorders rows) |
+| `Backspace`           | delete one char                                                    |
+| `Ctrl-W`              | delete one word                                                    |
+| `Ctrl-U`              | clear query                                                        |
+| `Ctrl-J` / `Ctrl-N`   | move down                                                          |
+| `Ctrl-K` / `Ctrl-P`   | move up                                                            |
+| `Enter`               | jump to selected pane and close                                    |
+| `Ctrl-D`              | mark selected agent seen (`done` → `idle`)                         |
+| `Ctrl-X` then `y`/`n` | interrupt selected pane with confirm                               |
+| `Ctrl-R`              | refresh now                                                        |
+| `Tab`                 | cycle sort mode (`grouped` → `priority` → `recent`)                |
+| `Esc`                 | clear query; if query is empty, quit                               |
+| `Ctrl-C`              | quit                                                               |
+
+`Ctrl-S` is intentionally unused because terminal flow control can freeze output on some systems.
+
+## Popup sorting and preview
+
+Sort modes:
+
+- `grouped` (default): tmux sessions are ordered by their most-recent agent. Single-agent sessions collapse to one row; sessions with multiple agents expand to indented per-window rows.
+- `priority`: flat list by herdr attention order: `blocked > done > working > idle`, with recency as the tiebreaker.
+- `recent`: flat list by `@pimux_ts` newest first.
+
+The right pane shows selected-agent details (project, model, pane id, cwd, state, elapsed time) and a read-only preview of the pi session JSONL transcript tail. It does not scrape or embed the live pi TUI.
 
 ## Blocked ("needs you") detection
 
@@ -67,7 +101,11 @@ The reporter is tool-name-agnostic. It flags ⚠ blocked two ways:
 2. **Explicit event** — any tool or extension can authoritatively flag itself:
 
    ```js
-   pi.events.emit("pimux:blocked", { active: true, id: "deploy-gate", label: "approve deploy?" });
+   pi.events.emit("pimux:blocked", {
+     active: true,
+     id: "deploy-gate",
+     label: "approve deploy?",
+   });
    // ...once the prompt is answered:
    pi.events.emit("pimux:blocked", { active: false, id: "deploy-gate" });
    ```
@@ -82,9 +120,3 @@ The reporter is tool-name-agnostic. It flags ⚠ blocked two ways:
   `questions`); multi-token entries (`request_input`) match a contiguous run.
 - `PIMUX_NOTIFY` — `blocked` (or `1`) to `notify-send` when an agent needs you;
   `all` to also notify on done. Unset = no notifications.
-
-## Limitations
-
-- **One agent per window** is assumed for the window rollup; with multiple panes the dot follows the window's active pane.
-- **Built-in tool-permission prompts** are not event-exposed by pi (they are `ctx.ui.confirm` calls, not tools), so they do not raise ⚠ unless the gating code emits `pimux:blocked`. Prompt-style *tools* are caught by name.
-- A crashed pi can leave a stale option until the pane closes; pimux marks such rows `stale` (foreground command is no longer `pi`).

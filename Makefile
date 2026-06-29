@@ -1,7 +1,6 @@
 BIN ?= $(HOME)/.local/bin/pimux
-EXT_DIR ?= $(HOME)/.pi/agent/extensions
 
-.PHONY: build install test vet fmt install-extension clean
+.PHONY: build install test vet fmt clean
 
 build:
 	go build -o pimux .
@@ -9,10 +8,7 @@ build:
 install:
 	go build -o $(BIN) .
 	@echo "installed $(BIN)"
-
-install-extension:
-	cp extension/pimux-reporter.ts $(EXT_DIR)/pimux-reporter.ts
-	@echo "installed $(EXT_DIR)/pimux-reporter.ts"
+	@echo "run 'pimux install-extension' to install the reporter"
 
 test:
 	go test ./...
