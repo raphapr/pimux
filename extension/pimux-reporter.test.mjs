@@ -106,8 +106,8 @@ test("shutdown unsets pane and window options", () => {
 });
 
 test("basename handles paths and trailing slashes", () => {
-	assert.equal(basename("/home/raphael/repos/ls-n8n"), "ls-n8n");
-	assert.equal(basename("/home/raphael/repos/ls-n8n/"), "ls-n8n");
+	assert.equal(basename("/work/repos/alpha"), "alpha");
+	assert.equal(basename("/work/repos/alpha/"), "alpha");
 	assert.equal(basename(""), "");
 });
 

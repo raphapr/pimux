@@ -30,15 +30,15 @@ func TestCaptureArgsDefaultsLines(t *testing.T) {
 }
 
 func TestJumpArgs(t *testing.T) {
-	ag := agent.Agent{PaneID: "%7", Session: "ls-n8n", Window: 2}
+	ag := agent.Agent{PaneID: "%7", Session: "alpha", Window: 2}
 	cmds := JumpArgs(ag)
 	if len(cmds) != 3 {
 		t.Fatalf("want 3 jump cmds, got %d", len(cmds))
 	}
-	if cmds[0][0] != "switch-client" || cmds[0][2] != "ls-n8n" {
+	if cmds[0][0] != "switch-client" || cmds[0][2] != "alpha" {
 		t.Fatalf("bad switch-client: %v", cmds[0])
 	}
-	if cmds[1][0] != "select-window" || cmds[1][2] != "ls-n8n:2" {
+	if cmds[1][0] != "select-window" || cmds[1][2] != "alpha:2" {
 		t.Fatalf("bad select-window: %v", cmds[1])
 	}
 	if cmds[2][0] != "select-pane" || cmds[2][2] != "%7" {
