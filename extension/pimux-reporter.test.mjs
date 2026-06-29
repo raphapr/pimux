@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Reporter, basename, blockingTools } from "./pimux-reporter.ts";
+import { Reporter, basename, blockingPatterns, isBlockingTool } from "./pimux-reporter.ts";
 
 // Build a Reporter with a spy that records the tmux state it last wrote.
 function make() {
@@ -111,9 +111,49 @@ test("basename handles paths and trailing slashes", () => {
 	assert.equal(basename(""), "");
 });
 
-test("blockingTools defaults to ask_user_question", () => {
-	const t = blockingTools();
-	assert.ok(t.has("ask_user_question"));
+test("isBlockingTool matches prompt-style names, not machine tools", () => {
+	const p = blockingPatterns();
+	for (const name of [
+		"ask_user_question",
+		"askUserQuestion",
+		"confirm_changes",
+		"request_permission",
+		"elicit_input",
+		"approve_release",
+	]) {
+		assert.ok(isBlockingTool(name, p), `should match ${name}`);
+	}
+	for (const name of ["task_runner", "run_task", "bash", "write_file", "select_rows", "cymbal_search"]) {
+		assert.equal(isBlockingTool(name, p), false, `should not match ${name}`);
+	}
+});
+
+test("isBlockingTool multi-token patterns are contiguous and ordered", () => {
+	assert.ok(isBlockingTool("request_input_now", ["request_input"]));
+	assert.equal(isBlockingTool("input_request", ["request_input"]), false);
+});
+
+test("blocked works for a non-tool (event) id", () => {
+	const writes = [];
+	const r = new Reporter({
+		pane: "%1",
+		project: "demo",
+		model: "m",
+		pid: 1,
+		sessionPath: "/s",
+		now: () => 0,
+		emit: (a) => writes.push(a),
+	});
+	r.start();
+	r.blockStart("pimux:blocked", "deploy gate");
+	const last = () => {
+		let v;
+		for (const a of writes) if (a[0] === "set-option" && a.includes("@pimux_state")) v = a[a.length - 1];
+		return v;
+	};
+	assert.equal(last(), "blocked");
+	r.blockEnd("pimux:blocked");
+	assert.equal(last(), "idle");
 });
 
 test("notify fires only on entering blocked and done", () => {

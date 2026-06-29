@@ -75,7 +75,9 @@ export class Reporter {
 		this.publish();
 	}
 
-	// A blocking tool (ask_user_question) started executing -> waiting on the user.
+	// A blocking tool (or a pimux:blocked emitter) is waiting on the user. Keyed
+	// by an arbitrary id (toolCallId for tools, caller-chosen id for events) so
+	// concurrent blocks clear independently.
 	blockStart(id: string, label = "needs input"): void {
 		if (!id) return;
 		this.blocked.set(id, label);
@@ -145,18 +147,65 @@ export class Reporter {
 	}
 }
 
-// Tools whose execution means "the agent is waiting on the user".
-export function blockingTools(): Set<string> {
+// Blocked detection is tool-name-agnostic. Instead of an exact allowlist we
+// match interaction verbs against the *tokens* of a tool name, so any
+// question/confirm/permission/elicitation tool counts without being named here,
+// while machine tools like `task_runner` (which merely contains "ask") do not.
+const DEFAULT_BLOCKING_PATTERNS = [
+	"ask",
+	"question",
+	"confirm",
+	"permission",
+	"elicit",
+	"approve",
+	"approval",
+];
+
+// Patterns the user can override/extend via $PIMUX_BLOCKING_TOOLS
+// (comma-separated; single tokens match by token prefix, multi-token entries
+// like "request_input" match a contiguous token run).
+export function blockingPatterns(): string[] {
 	const raw = (globalThis as any).process?.env?.PIMUX_BLOCKING_TOOLS;
 	if (raw && typeof raw === "string") {
-		return new Set(
-			raw
-				.split(",")
-				.map((s) => s.trim())
-				.filter(Boolean),
-		);
+		const custom = raw
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean);
+		if (custom.length) return custom;
 	}
-	return new Set(["ask_user_question"]);
+	return DEFAULT_BLOCKING_PATTERNS;
+}
+
+// Split a tool name into lowercase tokens across snake_case, kebab-case, spaces,
+// and camelCase boundaries.
+export function tokenize(name: string): string[] {
+	if (!name) return [];
+	return name
+		.replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+		.toLowerCase()
+		.split(/[^a-z0-9]+/)
+		.filter(Boolean);
+}
+
+// True when a tool name looks like it prompts the user. Single-token patterns
+// match a name token by equality or prefix (so "question" matches "questions");
+// multi-token patterns must appear as a contiguous token run.
+export function isBlockingTool(name: string, patterns: string[]): boolean {
+	const tokens = tokenize(name);
+	if (!tokens.length || !patterns?.length) return false;
+	for (const p of patterns) {
+		const pt = tokenize(p);
+		if (!pt.length) continue;
+		if (pt.length === 1) {
+			const pat = pt[0];
+			if (tokens.some((t) => t === pat || t.startsWith(pat))) return true;
+		} else {
+			for (let i = 0; i + pt.length <= tokens.length; i++) {
+				if (pt.every((t, j) => tokens[i + j] === t)) return true;
+			}
+		}
+	}
+	return false;
 }
 
 // --- pi extension wiring -------------------------------------------------
@@ -177,7 +226,7 @@ export default function (pi: any) {
 	// No-op outside tmux: the entire feature is tmux-scoped.
 	if (!env.TMUX || !env.TMUX_PANE) return;
 	const pane: string = env.TMUX_PANE;
-	const tools = blockingTools();
+	const patterns = blockingPatterns();
 	// $PIMUX_NOTIFY: unset/"" = off, "1"|"blocked" = notify on blocked,
 	// "all" = notify on blocked and done.
 	const notifyLevel = String(env.PIMUX_NOTIFY ?? "").trim().toLowerCase();
@@ -231,14 +280,24 @@ export default function (pi: any) {
 	pi.on("agent_end", () => reporter?.agentEnd());
 
 	pi.on("tool_execution_start", (event: any) => {
-		if (event?.toolName && tools.has(event.toolName)) {
+		if (event?.toolName && isBlockingTool(event.toolName, patterns)) {
 			reporter?.blockStart(event.toolCallId, "needs input");
 		}
 	});
 	pi.on("tool_execution_end", (event: any) => {
-		if (event?.toolName && tools.has(event.toolName)) {
+		if (event?.toolName && isBlockingTool(event.toolName, patterns)) {
 			reporter?.blockEnd(event.toolCallId);
 		}
+	});
+
+	// Tool-agnostic authoritative channel: any tool/extension can emit
+	//   pi.events.emit("pimux:blocked", { active, id?, label? })
+	// to flag/clear blocked without pimux knowing the tool's name. Pair start
+	// and end with a stable id when blocks can overlap.
+	pi.on("pimux:blocked", (event: any) => {
+		const id = String(event?.id ?? event?.label ?? "pimux:blocked");
+		if (event?.active === false) reporter?.blockEnd(id);
+		else reporter?.blockStart(id, event?.label ?? "needs input");
 	});
 
 	pi.on("session_shutdown", () => reporter?.shutdown());
