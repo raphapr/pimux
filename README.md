@@ -22,6 +22,7 @@ A small pi extension reports each agent's state into tmux pane options, and a po
 # 1. Binary
 make install                          # -> ~/.local/bin/pimux
 # or: go install github.com/raphapr/pimux@latest
+# or: download a release archive from GitHub
 
 # 2. Reporter extension (all pi sessions)
 pimux install-extension               # -> ~/.pi/agent/extensions/ (override with --dir / $PIMUX_EXT_DIR)
@@ -85,3 +86,14 @@ The reporter is tool-name-agnostic and flags blocked two ways:
 - `PIMUX_BLOCKING_TOOLS` — override the blocked-detection name patterns.
 - `PIMUX_NOTIFY` — `blocked` (or `1`) to `notify-send` on block; `all` to also notify on done. Unset = off.
 - `PIMUX_EXT_DIR` — target dir for `install-extension`.
+
+## Release
+
+Releases are built by GoReleaser on version tags.
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The GitHub Actions workflow runs `make test`, builds Linux and macOS archives for amd64/arm64, publishes checksums, and injects the tag into `pimux --version`.
