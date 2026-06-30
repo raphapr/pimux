@@ -4,6 +4,8 @@ See every [pi](https://github.com/earendil-works/pi-mono) agent across your tmux
 
 A small pi extension reports each agent's state into tmux pane options, and a popup lists every agent so you can jump in one keystroke. State comes from pi's own lifecycle events, not terminal scraping.
 
+![pimux popup](docs/assets/pimux.png)
+
 ## State model
 
 | State   | Meaning                                          | Dot      |
