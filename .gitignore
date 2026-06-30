@@ -1,3 +1,4 @@
 /pimux
+/dist/
 *.out
 extension/node_modules/

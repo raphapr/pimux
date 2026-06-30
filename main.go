@@ -22,7 +22,7 @@ import (
 	"github.com/raphapr/pimux/internal/ui"
 )
 
-const version = "0.1.0"
+var version = "0.1.0"
 
 const reporterFileName = "pimux-reporter.ts"
 
